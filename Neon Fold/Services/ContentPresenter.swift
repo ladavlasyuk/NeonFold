@@ -1,0 +1,121 @@
+import UIKit
+
+final class ContentPresenter {
+    static let shared = ContentPresenter()
+
+    private weak var presentedController: ContentBrowserController?
+    private var pendingDestination: String?
+    private var pendingForceReload = false
+    private var pendingAsNewPage = false
+    private var retryAttempts = 0
+
+    private init() {}
+
+    func present(destination: String, forceReload: Bool = false, asNewPage: Bool = false) {
+        if pendingDestination != destination {
+            pendingForceReload = forceReload
+            pendingAsNewPage = asNewPage
+        } else {
+            pendingForceReload = pendingForceReload || forceReload
+            pendingAsNewPage = pendingAsNewPage || asNewPage
+        }
+        pendingDestination = destination
+        retryAttempts = 0
+        DispatchQueue.main.async { [weak self] in
+            self?.attemptPresent()
+        }
+    }
+
+    func dismiss() {
+        pendingDestination = nil
+        pendingForceReload = false
+        pendingAsNewPage = false
+        if let controller = presentedController, controller.presentingViewController != nil {
+            controller.dismiss(animated: false)
+        }
+        presentedController = nil
+    }
+
+    private func attemptPresent() {
+        guard let destination = pendingDestination else { return }
+        let forceReload = pendingForceReload
+        let asNewPage = pendingAsNewPage
+
+        if let existing = presentedController, existing.presentingViewController != nil {
+            reloadIfNeeded(controller: existing, destination: destination, forceReload: forceReload, asNewPage: asNewPage)
+            pendingDestination = nil
+            pendingForceReload = false
+            pendingAsNewPage = false
+            return
+        }
+
+        guard let topVC = topmostController() else {
+            scheduleRetry()
+            return
+        }
+
+        if let existing = topVC as? ContentBrowserController {
+            presentedController = existing
+            reloadIfNeeded(controller: existing, destination: destination, forceReload: forceReload, asNewPage: asNewPage)
+            pendingDestination = nil
+            pendingForceReload = false
+            pendingAsNewPage = false
+            return
+        }
+
+        if topVC.isBeingPresented || topVC.isBeingDismissed {
+            scheduleRetry()
+            return
+        }
+
+        let controller = ContentBrowserController()
+        controller.destination = destination
+        controller.modalPresentationStyle = .fullScreen
+        controller.modalTransitionStyle = .crossDissolve
+
+        OrientationController.shared.unlockAllOrientations()
+
+        topVC.present(controller, animated: false) { [weak self] in
+            OrientationController.shared.unlockAllOrientations()
+            controller.setNeedsUpdateOfSupportedInterfaceOrientations()
+            UIViewController.attemptRotationToDeviceOrientation()
+            self?.presentedController = controller
+            self?.pendingDestination = nil
+            self?.pendingForceReload = false
+        }
+    }
+
+    private func reloadIfNeeded(controller: ContentBrowserController, destination: String, forceReload: Bool, asNewPage: Bool) {
+        guard forceReload || controller.destination != destination,
+              let address = URL(string: destination) else { return }
+        controller.destination = destination
+        if asNewPage {
+            controller.openAsNewPage(address: address)
+        } else {
+            controller.reload(address: address)
+        }
+    }
+
+    private func scheduleRetry() {
+        retryAttempts += 1
+        guard retryAttempts < 30 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.attemptPresent()
+        }
+    }
+
+    private func topmostController() -> UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let activeScene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first
+
+        guard let scene = activeScene else { return nil }
+
+        let keyWindow = scene.windows.first(where: { $0.isKeyWindow }) ?? scene.windows.first
+        guard var top = keyWindow?.rootViewController else { return nil }
+
+        while let presented = top.presentedViewController {
+            top = presented
+        }
+        return top
+    }
+}
